@@ -1,0 +1,33 @@
+# Compiled binaries
+/envd
+/envd.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# GoReleaser output
+dist/
+
+# Test and coverage output
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directory (not used with modules, but ignore just in case)
+vendor/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
