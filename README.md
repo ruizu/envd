@@ -99,7 +99,7 @@ FROM --platform=linux/arm64 ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 WORKDIR /app
 
 # Install envd (linux/arm64) into the image.
-ADD https://github.com/ruizu/envd/releases/latest/download/envd_linux_arm64.tar.gz /tmp/envd.tar.gz
+ADD https://github.com/ruizu/envd/releases/download/v0.0.1/envd_0.0.1_linux_arm64.tar.gz /tmp/envd.tar.gz
 RUN tar -xzf /tmp/envd.tar.gz -C /usr/local/bin envd && rm /tmp/envd.tar.gz
 
 COPY pyproject.toml uv.lock ./
@@ -140,6 +140,78 @@ Secret identifiers may be either the secret's name or its full ARN. Both
 
 The IAM role (or profile) that `envd` runs under must be allowed to call
 `secretsmanager:GetSecretValue` for each secret it resolves.
+
+### Secret ARNs and specific keys/versions
+
+Like ECS `secrets.valueFrom`, an ARN identifier may append optional fields to
+select a single JSON key and/or a specific version of the secret:
+
+```
+arn:aws:secretsmanager:region:aws_account_id:secret:secret-name:json-key:version-stage:version-id
+```
+
+All three trailing fields are optional, but you must keep the colon separators
+as placeholders for any field you skip:
+
+- `json-key` — return a single key from a JSON-object secret instead of the
+  whole document. Non-string values (numbers, booleans) are returned as their
+  JSON text.
+- `version-stage` — a staging label such as `AWSPREVIOUS`. Defaults to
+  `AWSCURRENT`. Cannot be combined with `version-id`.
+- `version-id` — a specific version ID. Cannot be combined with `version-stage`.
+
+Examples:
+
+```sh
+# Whole secret (name or bare ARN)
+envd run --env DB=prod/db cli-to-run
+envd run --env DB=arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-AbCdEf cli-to-run
+
+# A single JSON key ("username1") from the secret
+envd run --env USER=arn:aws:secretsmanager:us-east-1:123456789012:secret:appauth-AbCdEf:username1:: cli-to-run
+
+# A specific version stage
+envd run --env DB=arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-AbCdEf::AWSPREVIOUS: cli-to-run
+
+# A JSON key from a specific version ID
+envd run --env USER=arn:aws:secretsmanager:us-east-1:123456789012:secret:appauth-AbCdEf:username1::9d4cb84b-... cli-to-run
+```
+
+Plain secret names and non–Secrets Manager identifiers are used verbatim, so
+this only affects Secrets Manager ARNs.
+
+### Resolve short form
+
+As a shorthand, `envd` also accepts the Secrets Manager dynamic-reference body
+(the contents of a `{{resolve:...}}` reference, without the `resolve:` prefix):
+
+```
+secretsmanager:secret-id:field-type:json-key:version-stage
+```
+
+- `secret-id` — required, the secret's name (not an ARN in this form).
+- `field-type` — optional, defaults to and must be `SecretString`.
+- `json-key` — optional, selects a single key from a JSON-object secret.
+- `version-stage` — optional staging label, defaults to `AWSCURRENT`.
+
+Skipped fields keep their colon placeholders. Examples:
+
+```sh
+# Whole secret
+envd run --env DB=secretsmanager:prod/db cli-to-run
+
+# A single JSON key
+envd run --env PW=secretsmanager:prod/db:SecretString:password cli-to-run
+
+# JSON key with the default field-type
+envd run --env PW=secretsmanager:prod/db::password cli-to-run
+
+# A specific version stage of a JSON key
+envd run --env PW=secretsmanager:prod/db:SecretString:password:AWSPREVIOUS cli-to-run
+```
+
+Unlike the ARN form, this short form has no `version-id` field; use a
+`version-stage` (or the full ARN) to pin a version.
 
 ## Backends
 
