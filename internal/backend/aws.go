@@ -2,7 +2,9 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -38,20 +40,182 @@ func NewAWS(ctx context.Context, opts Options) (Backend, error) {
 	return &awsBackend{client: secretsmanager.NewFromConfig(cfg)}, nil
 }
 
-// GetSecret returns the secret string for the given secret identifier (name or ARN).
+// secretRef holds the components of a parsed secret identifier. For a plain
+// secret name (or an identifier without optional fields), only secretID is
+// populated and the remaining fields are empty.
+type secretRef struct {
+	// secretID is the identifier passed to the Secrets Manager API. It is
+	// either a plain secret name or the ARN up to and including the secret
+	// name (without the optional trailing fields).
+	secretID string
+	// jsonKey, if set, selects a single key from a JSON-formatted secret.
+	jsonKey string
+	// versionStage selects a specific staging label (e.g. AWSPREVIOUS).
+	versionStage string
+	// versionID selects a specific version by its unique ID.
+	versionID string
+}
+
+// parseSecretRef parses a secret identifier into its components. Three shapes
+// are recognized:
+//
+//  1. A Secrets Manager ARN with optional trailing fields:
+//
+//     arn:aws:secretsmanager:region:account:secret:secret-name:json-key:version-stage:version-id
+//
+//  2. A "secretsmanager:" prefixed short form:
+//
+//     secretsmanager:secret-id:field-type:json-key:version-stage
+//
+//  3. Anything else (a plain secret name), used verbatim.
+//
+// Optional fields are empty by default and fall back to Secrets Manager's
+// defaults (full secret contents / AWSCURRENT).
+func parseSecretRef(id string) (secretRef, error) {
+	switch {
+	case strings.HasPrefix(id, "arn:"):
+		return parseARNRef(id), nil
+	case strings.HasPrefix(id, "secretsmanager:"):
+		return parseResolveRef(id)
+	default:
+		return secretRef{secretID: id}, nil
+	}
+}
+
+// parseARNRef parses a Secrets Manager ARN with optional trailing
+// json-key, version-stage, and version-id fields. ARNs for other services
+// (or malformed ones) are returned verbatim as the secretID.
+func parseARNRef(id string) secretRef {
+	parts := strings.Split(id, ":")
+	// A Secrets Manager ARN has the fixed prefix:
+	//   arn(0):aws(1):secretsmanager(2):region(3):account(4):secret(5):name(6)
+	// followed by up to three optional fields (7,8,9). Fewer than 7 parts, or
+	// a non-secretsmanager service, means this is not a shape we extend.
+	if len(parts) < 7 || parts[2] != "secretsmanager" || parts[5] != "secret" {
+		return secretRef{secretID: id}
+	}
+
+	ref := secretRef{
+		// Rejoin the fixed ARN prefix through the secret name as the SecretId.
+		secretID: strings.Join(parts[:7], ":"),
+	}
+	if len(parts) > 7 {
+		ref.jsonKey = parts[7]
+	}
+	if len(parts) > 8 {
+		ref.versionStage = parts[8]
+	}
+	if len(parts) > 9 {
+		ref.versionID = parts[9]
+	}
+	return ref
+}
+
+// parseResolveRef parses the "secretsmanager:" prefixed short form:
+//
+//	secretsmanager:secret-id:field-type:json-key:version-stage
+//
+// secret-id is required and must be a plain secret name (not an ARN). The
+// field-type, json-key, and version-stage fields are optional; skipped fields
+// keep their colon placeholders. field-type, when present, must be
+// SecretString (the only supported value).
+func parseResolveRef(id string) (secretRef, error) {
+	// Drop the "secretsmanager:" prefix, then split the remainder. Limit the
+	// split so a json-key or later field cannot be truncated by stray colons
+	// beyond the fields we recognize.
+	body := strings.TrimPrefix(id, "secretsmanager:")
+	parts := strings.SplitN(body, ":", 4)
+
+	name := parts[0]
+	if name == "" {
+		return secretRef{}, fmt.Errorf("invalid secret reference %q: missing secret id", id)
+	}
+
+	ref := secretRef{secretID: name}
+	if len(parts) > 1 && parts[1] != "" && parts[1] != "SecretString" {
+		return secretRef{}, fmt.Errorf("invalid secret reference %q: field-type must be SecretString, got %q", id, parts[1])
+	}
+	if len(parts) > 2 {
+		ref.jsonKey = parts[2]
+	}
+	if len(parts) > 3 {
+		ref.versionStage = parts[3]
+	}
+	return ref, nil
+}
+
+// GetSecret returns the secret string for the given secret identifier.
+//
+// The identifier may be a plain secret name, a Secrets Manager ARN that appends
+// optional :json-key:version-stage:version-id fields, or a "secretsmanager:"
+// prefixed short form (secretsmanager:secret-id:field-type:json-key:version-stage)
+// to select a specific JSON key and/or secret version.
 func (b *awsBackend) GetSecret(ctx context.Context, secretID string) (string, error) {
-	out, err := b.client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
-		SecretId: aws.String(secretID),
-	})
+	ref, err := parseSecretRef(secretID)
+	if err != nil {
+		return "", err
+	}
+
+	in := &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(ref.secretID),
+	}
+	if ref.versionStage != "" {
+		in.VersionStage = aws.String(ref.versionStage)
+	}
+	if ref.versionID != "" {
+		in.VersionId = aws.String(ref.versionID)
+	}
+
+	out, err := b.client.GetSecretValue(ctx, in)
 	if err != nil {
 		return "", fmt.Errorf("getting secret %q: %w", secretID, err)
 	}
 
-	if out.SecretString != nil {
+	value, err := secretValue(secretID, out)
+	if err != nil {
+		return "", err
+	}
+
+	// When a JSON key is requested, the secret value must be a JSON object and
+	// the selected key's value is returned instead of the whole document.
+	if ref.jsonKey != "" {
+		return extractJSONKey(secretID, ref.jsonKey, value)
+	}
+	return value, nil
+}
+
+// secretValue extracts the string value from a GetSecretValue response,
+// preferring SecretString over SecretBinary. A present-but-empty SecretString
+// is a valid value; only the absence of both fields is an error.
+func secretValue(secretID string, out *secretsmanager.GetSecretValueOutput) (string, error) {
+	switch {
+	case out.SecretString != nil:
 		return *out.SecretString, nil
-	}
-	if out.SecretBinary != nil {
+	case out.SecretBinary != nil:
 		return string(out.SecretBinary), nil
+	default:
+		return "", fmt.Errorf("secret %q has no value", secretID)
 	}
-	return "", fmt.Errorf("secret %q has no value", secretID)
+}
+
+// extractJSONKey parses value as a JSON object and returns the string value of
+// key. Non-string JSON values (numbers, booleans) are rendered as their JSON
+// text so numeric secrets remain usable.
+func extractJSONKey(secretID, key, value string) (string, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(value), &obj); err != nil {
+		return "", fmt.Errorf("secret %q is not a JSON object; cannot extract key %q: %w", secretID, key, err)
+	}
+	raw, ok := obj[key]
+	if !ok {
+		return "", fmt.Errorf("secret %q has no JSON key %q", secretID, key)
+	}
+
+	// Prefer decoding as a string so quotes/escapes are unwrapped; fall back to
+	// the raw JSON text for non-string values.
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, nil
+	}
+	return string(raw), nil
 }
