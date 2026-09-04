@@ -16,10 +16,11 @@ import (
 func newRootCmd() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "envd",
-		Short: "Load secrets from a backend into env vars, then exec a command",
-		Long: "envd resolves one or more --env VAR=secret_id mappings against a secret\n" +
-			"backend (currently AWS Secrets Manager), injects them as environment\n" +
-			"variables, and then executes the provided command with those variables set.",
+		Short: "Load secret and parameter values from a backend into env vars, then exec a command",
+		Long: "envd resolves one or more --env VAR=secret_id mappings against a backend\n" +
+			"(currently AWS Secrets Manager and Systems Manager Parameter Store),\n" +
+			"injects them as environment variables, and then executes the provided\n" +
+			"command with those variables set.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

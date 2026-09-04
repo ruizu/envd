@@ -7,7 +7,9 @@ its entrypoint.
 
 Currently supported backends:
 
-- **AWS Secrets Manager** (`--backend=aws`, the default)
+- **AWS** (`--backend=aws`, the default) — resolves identifiers against either
+  **AWS Secrets Manager** or **AWS Systems Manager Parameter Store**,
+  depending on the identifier's shape (see below).
 
 ## Why envd exists
 
@@ -139,7 +141,9 @@ Secret identifiers may be either the secret's name or its full ARN. Both
 `SecretString` and `SecretBinary` values are supported.
 
 The IAM role (or profile) that `envd` runs under must be allowed to call
-`secretsmanager:GetSecretValue` for each secret it resolves.
+`secretsmanager:GetSecretValue` for identifiers resolved against Secrets
+Manager, and `ssm:GetParameter` for identifiers resolved against Parameter
+Store.
 
 ### Secret ARNs and specific keys/versions
 
@@ -212,6 +216,39 @@ envd run --env PW=secretsmanager:prod/db:SecretString:password:AWSPREVIOUS cli-t
 
 Unlike the ARN form, this short form has no `version-id` field; use a
 `version-stage` (or the full ARN) to pin a version.
+
+### Systems Manager Parameter Store
+
+An identifier is resolved against Parameter Store instead of Secrets Manager
+when it is a Parameter Store ARN or uses the `ssm:` prefixed short form:
+
+```
+arn:aws:ssm:region:aws_account_id:parameter/parameter-name
+ssm:parameter-name
+```
+
+Unlike the Secrets Manager forms above, neither of these supports a JSON key
+or a version/label field — Parameter Store parameters hold a single value.
+To read a specific version or label, include it directly in the parameter
+name as SSM itself expects (`parameter-name:label` or
+`parameter-name:version`), since `GetParameter` interprets that suffix
+natively.
+
+`SecureString` parameters are automatically decrypted.
+
+Examples:
+
+```sh
+# By parameter name
+envd run --env DB_HOST=ssm:/prod/db/host cli-to-run
+
+# By full ARN
+envd run --env DB_HOST=arn:aws:ssm:us-east-1:123456789012:parameter/prod/db/host cli-to-run
+
+# A specific parameter version or label
+envd run --env DB_HOST=ssm:/prod/db/host:3 cli-to-run
+envd run --env DB_HOST=ssm:/prod/db/host:prod cli-to-run
+```
 
 ## Backends
 

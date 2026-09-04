@@ -16,20 +16,16 @@ func TestNewUnknownBackend(t *testing.T) {
 	}
 }
 
-func TestNewAWSAliases(t *testing.T) {
-	// All of these names should dispatch to the AWS backend. Region is set to
-	// avoid any environment-dependent region resolution; no network call is
-	// made during construction (credentials are resolved lazily at GetSecret).
-	for _, name := range []string{"aws", "aws-secrets-manager", "secretsmanager"} {
-		t.Run(name, func(t *testing.T) {
-			b, err := New(context.Background(), name, Options{Region: "us-east-1"})
-			if err != nil {
-				t.Fatalf("unexpected error constructing %q backend: %v", name, err)
-			}
-			if b == nil {
-				t.Fatalf("expected non-nil backend for %q", name)
-			}
-		})
+func TestNewAWS(t *testing.T) {
+	// Region is set to avoid any environment-dependent region resolution; no
+	// network call is made during construction (credentials are resolved
+	// lazily at Resolve).
+	b, err := New(context.Background(), "aws", Options{Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("unexpected error constructing aws backend: %v", err)
+	}
+	if b == nil {
+		t.Fatal("expected non-nil backend")
 	}
 }
 

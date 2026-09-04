@@ -6,10 +6,10 @@ import (
 	"fmt"
 )
 
-// Backend retrieves secret values by their identifier.
+// Backend resolves values (secrets, parameters, etc.) by their identifier.
 type Backend interface {
-	// GetSecret returns the secret value for the given secret identifier.
-	GetSecret(ctx context.Context, secretID string) (string, error)
+	// Resolve returns the value for the given identifier.
+	Resolve(ctx context.Context, id string) (string, error)
 }
 
 // Options configures the construction of a Backend.
@@ -23,7 +23,7 @@ type Options struct {
 // New returns a Backend for the given name.
 func New(ctx context.Context, name string, opts Options) (Backend, error) {
 	switch name {
-	case "aws", "aws-secrets-manager", "secretsmanager":
+	case "aws":
 		return NewAWS(ctx, opts)
 	default:
 		return nil, fmt.Errorf("unknown backend %q", name)

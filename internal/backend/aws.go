@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
 // secretsClient is the subset of the AWS Secrets Manager client that the
@@ -17,12 +18,23 @@ type secretsClient interface {
 	GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
 }
 
-// awsBackend retrieves secrets from AWS Secrets Manager.
-type awsBackend struct {
-	client secretsClient
+// parameterClient is the subset of the AWS Systems Manager client that the
+// backend uses to read Parameter Store values. It is an interface so the
+// backend can be tested with a fake.
+type parameterClient interface {
+	GetParameter(ctx context.Context, params *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
 }
 
-// NewAWS constructs an AWS Secrets Manager backend using the given options.
+// awsBackend retrieves secrets from AWS Secrets Manager and parameters from
+// AWS Systems Manager Parameter Store.
+type awsBackend struct {
+	secrets secretsClient
+	params  parameterClient
+}
+
+// NewAWS constructs an AWS backend using the given options. Identifiers are
+// routed to Secrets Manager or Parameter Store based on their shape; see
+// Resolve.
 func NewAWS(ctx context.Context, opts Options) (Backend, error) {
 	loadOpts := []func(*config.LoadOptions) error{}
 	if opts.Profile != "" {
@@ -37,7 +49,10 @@ func NewAWS(ctx context.Context, opts Options) (Backend, error) {
 		return nil, fmt.Errorf("loading aws config: %w", err)
 	}
 
-	return &awsBackend{client: secretsmanager.NewFromConfig(cfg)}, nil
+	return &awsBackend{
+		secrets: secretsmanager.NewFromConfig(cfg),
+		params:  ssm.NewFromConfig(cfg),
+	}, nil
 }
 
 // secretRef holds the components of a parsed secret identifier. For a plain
@@ -76,7 +91,7 @@ func parseSecretRef(id string) (secretRef, error) {
 	case strings.HasPrefix(id, "arn:"):
 		return parseARNRef(id), nil
 	case strings.HasPrefix(id, "secretsmanager:"):
-		return parseResolveRef(id)
+		return parseShortRef(id)
 	default:
 		return secretRef{secretID: id}, nil
 	}
@@ -111,7 +126,7 @@ func parseARNRef(id string) secretRef {
 	return ref
 }
 
-// parseResolveRef parses the "secretsmanager:" prefixed short form:
+// parseShortRef parses the "secretsmanager:" prefixed short form:
 //
 //	secretsmanager:secret-id:field-type:json-key:version-stage
 //
@@ -119,7 +134,7 @@ func parseARNRef(id string) secretRef {
 // field-type, json-key, and version-stage fields are optional; skipped fields
 // keep their colon placeholders. field-type, when present, must be
 // SecretString (the only supported value).
-func parseResolveRef(id string) (secretRef, error) {
+func parseShortRef(id string) (secretRef, error) {
 	// Drop the "secretsmanager:" prefix, then split the remainder. Limit the
 	// split so a json-key or later field cannot be truncated by stray colons
 	// beyond the fields we recognize.
@@ -144,14 +159,24 @@ func parseResolveRef(id string) (secretRef, error) {
 	return ref, nil
 }
 
-// GetSecret returns the secret string for the given secret identifier.
+// Resolve returns the secret or parameter value for the given identifier.
 //
-// The identifier may be a plain secret name, a Secrets Manager ARN that appends
-// optional :json-key:version-stage:version-id fields, or a "secretsmanager:"
-// prefixed short form (secretsmanager:secret-id:field-type:json-key:version-stage)
-// to select a specific JSON key and/or secret version.
-func (b *awsBackend) GetSecret(ctx context.Context, secretID string) (string, error) {
-	ref, err := parseSecretRef(secretID)
+// The identifier may be:
+//
+//   - A plain secret name, a Secrets Manager ARN that appends optional
+//     :json-key:version-stage:version-id fields, or a "secretsmanager:"
+//     prefixed short form (secretsmanager:secret-id:field-type:json-key:version-stage)
+//     to select a specific JSON key and/or secret version — resolved
+//     against Secrets Manager.
+//   - A Systems Manager parameter ARN, or an "ssm:" prefixed short form
+//     (ssm:parameter-name) — resolved against Parameter Store. Neither form
+//     supports a JSON key or version selector.
+func (b *awsBackend) Resolve(ctx context.Context, id string) (string, error) {
+	if name, ok := parseParameterRef(id); ok {
+		return b.getParameter(ctx, id, name)
+	}
+
+	ref, err := parseSecretRef(id)
 	if err != nil {
 		return "", err
 	}
@@ -166,12 +191,12 @@ func (b *awsBackend) GetSecret(ctx context.Context, secretID string) (string, er
 		in.VersionId = aws.String(ref.versionID)
 	}
 
-	out, err := b.client.GetSecretValue(ctx, in)
+	out, err := b.secrets.GetSecretValue(ctx, in)
 	if err != nil {
-		return "", fmt.Errorf("getting secret %q: %w", secretID, err)
+		return "", fmt.Errorf("getting secret %q: %w", id, err)
 	}
 
-	value, err := secretValue(secretID, out)
+	value, err := secretValue(id, out)
 	if err != nil {
 		return "", err
 	}
@@ -179,9 +204,52 @@ func (b *awsBackend) GetSecret(ctx context.Context, secretID string) (string, er
 	// When a JSON key is requested, the secret value must be a JSON object and
 	// the selected key's value is returned instead of the whole document.
 	if ref.jsonKey != "" {
-		return extractJSONKey(secretID, ref.jsonKey, value)
+		return extractJSONKey(id, ref.jsonKey, value)
 	}
 	return value, nil
+}
+
+// parseParameterRef reports whether id targets Systems Manager Parameter
+// Store, returning the value to pass as GetParameter's Name field. Two shapes
+// are recognized:
+//
+//  1. A parameter ARN: arn:aws:ssm:region:account:parameter/name. It is
+//     passed through unchanged; GetParameter accepts ARNs directly.
+//  2. An "ssm:" prefixed short form: ssm:parameter-name.
+//
+// Unlike Secrets Manager identifiers, no optional trailing fields (JSON key,
+// version, or label) are supported here.
+func parseParameterRef(id string) (string, bool) {
+	if strings.HasPrefix(id, "arn:") {
+		parts := strings.Split(id, ":")
+		// A Systems Manager parameter ARN has the fixed prefix:
+		//   arn(0):aws(1):ssm(2):region(3):account(4):parameter/name(5)
+		if len(parts) >= 6 && parts[2] == "ssm" && strings.HasPrefix(parts[5], "parameter") {
+			return id, true
+		}
+		return "", false
+	}
+	if rest, ok := strings.CutPrefix(id, "ssm:"); ok {
+		return rest, true
+	}
+	return "", false
+}
+
+// getParameter fetches a value from Parameter Store. Secure string parameters
+// are decrypted; the WithDecryption flag has no effect on other parameter
+// types.
+func (b *awsBackend) getParameter(ctx context.Context, id, name string) (string, error) {
+	out, err := b.params.GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           aws.String(name),
+		WithDecryption: aws.Bool(true),
+	})
+	if err != nil {
+		return "", fmt.Errorf("getting parameter %q: %w", id, err)
+	}
+	if out.Parameter == nil || out.Parameter.Value == nil {
+		return "", fmt.Errorf("parameter %q has no value", id)
+	}
+	return *out.Parameter.Value, nil
 }
 
 // secretValue extracts the string value from a GetSecretValue response,
