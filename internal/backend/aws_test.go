@@ -8,6 +8,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
 // fakeSecretsClient is a test double for the AWS Secrets Manager client.
@@ -37,13 +39,36 @@ func (f *fakeSecretsClient) GetSecretValue(_ context.Context, in *secretsmanager
 	return f.out, f.err
 }
 
-func TestGetSecretString(t *testing.T) {
+// fakeParameterClient is a test double for the AWS Systems Manager client.
+type fakeParameterClient struct {
+	out *ssm.GetParameterOutput
+	err error
+	// gotName captures the Name passed in, to assert it is forwarded.
+	gotName string
+	// gotWithDecryption captures whether decryption was requested.
+	gotWithDecryption bool
+	// called records whether GetParameter was invoked at all.
+	called bool
+}
+
+func (f *fakeParameterClient) GetParameter(_ context.Context, in *ssm.GetParameterInput, _ ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
+	f.called = true
+	if in.Name != nil {
+		f.gotName = *in.Name
+	}
+	if in.WithDecryption != nil {
+		f.gotWithDecryption = *in.WithDecryption
+	}
+	return f.out, f.err
+}
+
+func TestResolveString(t *testing.T) {
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{SecretString: aws.String("plain-secret")},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), "my/secret")
+	got, err := b.Resolve(context.Background(), "my/secret")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -55,13 +80,13 @@ func TestGetSecretString(t *testing.T) {
 	}
 }
 
-func TestGetSecretBinary(t *testing.T) {
+func TestResolveBinary(t *testing.T) {
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{SecretBinary: []byte("binary-secret")},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), "id")
+	got, err := b.Resolve(context.Background(), "id")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,7 +95,7 @@ func TestGetSecretBinary(t *testing.T) {
 	}
 }
 
-func TestGetSecretPrefersStringOverBinary(t *testing.T) {
+func TestResolvePrefersStringOverBinary(t *testing.T) {
 	// When both are set, SecretString takes precedence.
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{
@@ -78,9 +103,9 @@ func TestGetSecretPrefersStringOverBinary(t *testing.T) {
 			SecretBinary: []byte("the-binary"),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), "id")
+	got, err := b.Resolve(context.Background(), "id")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -89,14 +114,14 @@ func TestGetSecretPrefersStringOverBinary(t *testing.T) {
 	}
 }
 
-func TestGetSecretEmptyString(t *testing.T) {
+func TestResolveEmptyString(t *testing.T) {
 	// A present-but-empty SecretString is a valid value, not an error.
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{SecretString: aws.String("")},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), "id")
+	got, err := b.Resolve(context.Background(), "id")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -105,12 +130,12 @@ func TestGetSecretEmptyString(t *testing.T) {
 	}
 }
 
-func TestGetSecretNoValue(t *testing.T) {
+func TestResolveNoValue(t *testing.T) {
 	// Neither SecretString nor SecretBinary set -> error.
 	fake := &fakeSecretsClient{out: &secretsmanager.GetSecretValueOutput{}}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	_, err := b.GetSecret(context.Background(), "id")
+	_, err := b.Resolve(context.Background(), "id")
 	if err == nil {
 		t.Fatal("expected error when secret has no value")
 	}
@@ -119,12 +144,12 @@ func TestGetSecretNoValue(t *testing.T) {
 	}
 }
 
-func TestGetSecretAPIError(t *testing.T) {
+func TestResolveAPIError(t *testing.T) {
 	sentinel := errors.New("access denied")
 	fake := &fakeSecretsClient{err: sentinel}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	_, err := b.GetSecret(context.Background(), "id")
+	_, err := b.Resolve(context.Background(), "id")
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected API error to propagate, got: %v", err)
 	}
@@ -184,47 +209,47 @@ func TestParseSecretRef(t *testing.T) {
 		},
 		// short form: secretsmanager:secret-id:field-type:json-key:version-stage
 		{
-			name: "resolve name only",
+			name: "short form name only",
 			id:   "secretsmanager:prod/db",
 			want: secretRef{secretID: "prod/db"},
 		},
 		{
-			name: "resolve with field-type",
+			name: "short form with field-type",
 			id:   "secretsmanager:prod/db:SecretString",
 			want: secretRef{secretID: "prod/db"},
 		},
 		{
-			name: "resolve with json key",
+			name: "short form with json key",
 			id:   "secretsmanager:prod/db:SecretString:username",
 			want: secretRef{secretID: "prod/db", jsonKey: "username"},
 		},
 		{
-			name: "resolve with json key default field-type",
+			name: "short form with json key default field-type",
 			id:   "secretsmanager:prod/db::username",
 			want: secretRef{secretID: "prod/db", jsonKey: "username"},
 		},
 		{
-			name: "resolve with json key and version stage",
+			name: "short form with json key and version stage",
 			id:   "secretsmanager:prod/db:SecretString:username:AWSPREVIOUS",
 			want: secretRef{secretID: "prod/db", jsonKey: "username", versionStage: "AWSPREVIOUS"},
 		},
 		{
-			name: "resolve with version stage only",
+			name: "short form with version stage only",
 			id:   "secretsmanager:prod/db:::AWSPREVIOUS",
 			want: secretRef{secretID: "prod/db", versionStage: "AWSPREVIOUS"},
 		},
 		{
-			name: "resolve json key containing colons preserved",
+			name: "short form json key containing colons preserved",
 			id:   "secretsmanager:prod/db:SecretString:a:b:c",
 			want: secretRef{secretID: "prod/db", jsonKey: "a", versionStage: "b:c"},
 		},
 		{
-			name:    "resolve missing secret id",
+			name:    "short form missing secret id",
 			id:      "secretsmanager:",
 			wantErr: true,
 		},
 		{
-			name:    "resolve invalid field-type",
+			name:    "short form invalid field-type",
 			id:      "secretsmanager:prod/db:Binary",
 			wantErr: true,
 		},
@@ -249,14 +274,14 @@ func TestParseSecretRef(t *testing.T) {
 	}
 }
 
-func TestGetSecretARNStripsTrailingFields(t *testing.T) {
+func TestResolveARNStripsTrailingFields(t *testing.T) {
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf"
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{SecretString: aws.String("plain")},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	if _, err := b.GetSecret(context.Background(), arn+":::"); err != nil {
+	if _, err := b.Resolve(context.Background(), arn+":::"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.gotID != arn {
@@ -264,16 +289,16 @@ func TestGetSecretARNStripsTrailingFields(t *testing.T) {
 	}
 }
 
-func TestGetSecretJSONKey(t *testing.T) {
+func TestResolveJSONKey(t *testing.T) {
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf"
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{
 			SecretString: aws.String(`{"username1":"password1","username2":"password2"}`),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), arn+":username2::")
+	got, err := b.Resolve(context.Background(), arn+":username2::")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -282,7 +307,7 @@ func TestGetSecretJSONKey(t *testing.T) {
 	}
 }
 
-func TestGetSecretJSONKeyNumericValue(t *testing.T) {
+func TestResolveJSONKeyNumericValue(t *testing.T) {
 	// Non-string JSON values are rendered as their JSON text.
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:cfg-AbCdEf"
 	fake := &fakeSecretsClient{
@@ -290,9 +315,9 @@ func TestGetSecretJSONKeyNumericValue(t *testing.T) {
 			SecretString: aws.String(`{"port":5432}`),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), arn+":port::")
+	got, err := b.Resolve(context.Background(), arn+":port::")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -301,16 +326,16 @@ func TestGetSecretJSONKeyNumericValue(t *testing.T) {
 	}
 }
 
-func TestGetSecretJSONKeyMissing(t *testing.T) {
+func TestResolveJSONKeyMissing(t *testing.T) {
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf"
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{
 			SecretString: aws.String(`{"username1":"password1"}`),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	_, err := b.GetSecret(context.Background(), arn+":nope::")
+	_, err := b.Resolve(context.Background(), arn+":nope::")
 	if err == nil {
 		t.Fatal("expected error for missing JSON key")
 	}
@@ -319,16 +344,16 @@ func TestGetSecretJSONKeyMissing(t *testing.T) {
 	}
 }
 
-func TestGetSecretJSONKeyNotJSON(t *testing.T) {
+func TestResolveJSONKeyNotJSON(t *testing.T) {
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf"
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{
 			SecretString: aws.String("not-json"),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	_, err := b.GetSecret(context.Background(), arn+":key::")
+	_, err := b.Resolve(context.Background(), arn+":key::")
 	if err == nil {
 		t.Fatal("expected error when secret is not a JSON object")
 	}
@@ -337,15 +362,15 @@ func TestGetSecretJSONKeyNotJSON(t *testing.T) {
 	}
 }
 
-func TestGetSecretVersionSelectorsForwarded(t *testing.T) {
+func TestResolveVersionSelectorsForwarded(t *testing.T) {
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf"
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{SecretString: aws.String("v")},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
 	// version-stage
-	if _, err := b.GetSecret(context.Background(), arn+"::AWSPREVIOUS:"); err != nil {
+	if _, err := b.Resolve(context.Background(), arn+"::AWSPREVIOUS:"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.gotVersionStage != "AWSPREVIOUS" {
@@ -357,7 +382,7 @@ func TestGetSecretVersionSelectorsForwarded(t *testing.T) {
 
 	// version-id
 	fake.gotVersionStage = ""
-	if _, err := b.GetSecret(context.Background(), arn+":::abc-123"); err != nil {
+	if _, err := b.Resolve(context.Background(), arn+":::abc-123"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.gotVersionID != "abc-123" {
@@ -368,15 +393,15 @@ func TestGetSecretVersionSelectorsForwarded(t *testing.T) {
 	}
 }
 
-func TestGetSecretResolveForm(t *testing.T) {
+func TestResolveShortForm(t *testing.T) {
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{
 			SecretString: aws.String(`{"username":"alice","password":"s3cr3t"}`),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), "secretsmanager:prod/db:SecretString:password:AWSPREVIOUS")
+	got, err := b.Resolve(context.Background(), "secretsmanager:prod/db:SecretString:password:AWSPREVIOUS")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -391,14 +416,14 @@ func TestGetSecretResolveForm(t *testing.T) {
 	}
 }
 
-func TestGetSecretResolveWholeValue(t *testing.T) {
+func TestResolveShortFormWholeValue(t *testing.T) {
 	// The short form with no json-key returns the whole secret verbatim.
 	fake := &fakeSecretsClient{
 		out: &secretsmanager.GetSecretValueOutput{SecretString: aws.String(`{"a":"b"}`)},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), "secretsmanager:prod/db")
+	got, err := b.Resolve(context.Background(), "secretsmanager:prod/db")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -413,7 +438,7 @@ func TestGetSecretResolveWholeValue(t *testing.T) {
 	}
 }
 
-func TestGetSecretParseErrorSkipsClient(t *testing.T) {
+func TestResolveParseErrorSkipsClient(t *testing.T) {
 	// An invalid short-form reference must fail before any API call is made.
 	tests := []string{
 		"secretsmanager:",               // missing secret id
@@ -424,9 +449,9 @@ func TestGetSecretParseErrorSkipsClient(t *testing.T) {
 			fake := &fakeSecretsClient{
 				out: &secretsmanager.GetSecretValueOutput{SecretString: aws.String("x")},
 			}
-			b := &awsBackend{client: fake}
+			b := &awsBackend{secrets: fake}
 
-			if _, err := b.GetSecret(context.Background(), id); err == nil {
+			if _, err := b.Resolve(context.Background(), id); err == nil {
 				t.Fatalf("expected parse error for %q", id)
 			}
 			if fake.called {
@@ -436,7 +461,7 @@ func TestGetSecretParseErrorSkipsClient(t *testing.T) {
 	}
 }
 
-func TestGetSecretJSONKeyFromBinary(t *testing.T) {
+func TestResolveJSONKeyFromBinary(t *testing.T) {
 	// A json-key can be extracted from a JSON document stored as SecretBinary.
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:cfg-AbCdEf"
 	fake := &fakeSecretsClient{
@@ -444,9 +469,9 @@ func TestGetSecretJSONKeyFromBinary(t *testing.T) {
 			SecretBinary: []byte(`{"token":"abc123"}`),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), arn+":token::")
+	got, err := b.Resolve(context.Background(), arn+":token::")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -455,7 +480,7 @@ func TestGetSecretJSONKeyFromBinary(t *testing.T) {
 	}
 }
 
-func TestGetSecretJSONKeyBooleanValue(t *testing.T) {
+func TestResolveJSONKeyBooleanValue(t *testing.T) {
 	// Boolean values are rendered as their JSON text.
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:cfg-AbCdEf"
 	fake := &fakeSecretsClient{
@@ -463,9 +488,9 @@ func TestGetSecretJSONKeyBooleanValue(t *testing.T) {
 			SecretString: aws.String(`{"enabled":true}`),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), arn+":enabled::")
+	got, err := b.Resolve(context.Background(), arn+":enabled::")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -474,7 +499,7 @@ func TestGetSecretJSONKeyBooleanValue(t *testing.T) {
 	}
 }
 
-func TestGetSecretJSONKeyNestedValue(t *testing.T) {
+func TestResolveJSONKeyNestedValue(t *testing.T) {
 	// Object/array values are returned as their raw JSON text.
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:cfg-AbCdEf"
 	fake := &fakeSecretsClient{
@@ -482,9 +507,9 @@ func TestGetSecretJSONKeyNestedValue(t *testing.T) {
 			SecretString: aws.String(`{"nested":{"k":"v"},"list":[1,2]}`),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	gotObj, err := b.GetSecret(context.Background(), arn+":nested::")
+	gotObj, err := b.Resolve(context.Background(), arn+":nested::")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -492,7 +517,7 @@ func TestGetSecretJSONKeyNestedValue(t *testing.T) {
 		t.Fatalf("nested object: got %q, want %q", gotObj, `{"k":"v"}`)
 	}
 
-	gotList, err := b.GetSecret(context.Background(), arn+":list::")
+	gotList, err := b.Resolve(context.Background(), arn+":list::")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -501,7 +526,7 @@ func TestGetSecretJSONKeyNestedValue(t *testing.T) {
 	}
 }
 
-func TestGetSecretARNJSONKeyWithVersionID(t *testing.T) {
+func TestResolveARNJSONKeyWithVersionID(t *testing.T) {
 	// End-to-end: ARN with both a json-key and a version-id.
 	const arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf"
 	fake := &fakeSecretsClient{
@@ -509,9 +534,9 @@ func TestGetSecretARNJSONKeyWithVersionID(t *testing.T) {
 			SecretString: aws.String(`{"username1":"alice"}`),
 		},
 	}
-	b := &awsBackend{client: fake}
+	b := &awsBackend{secrets: fake}
 
-	got, err := b.GetSecret(context.Background(), arn+":username1::9d4cb84b-ad69-40c0-a0ab-cead3EXAMPLE")
+	got, err := b.Resolve(context.Background(), arn+":username1::9d4cb84b-ad69-40c0-a0ab-cead3EXAMPLE")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -537,5 +562,147 @@ func TestExtractJSONKeyStringWithEscapes(t *testing.T) {
 	}
 	if got != "line1\nline2" {
 		t.Fatalf("got %q, want unescaped newline", got)
+	}
+}
+
+func TestParseParameterRef(t *testing.T) {
+	tests := []struct {
+		name     string
+		id       string
+		wantName string
+		wantOK   bool
+	}{
+		{
+			name:   "plain name is not a parameter ref",
+			id:     "my/param",
+			wantOK: false,
+		},
+		{
+			name:   "secrets manager arn is not a parameter ref",
+			id:     "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf",
+			wantOK: false,
+		},
+		{
+			name:     "ssm parameter arn",
+			id:       "arn:aws:ssm:us-east-1:123456789012:parameter/my/param",
+			wantName: "arn:aws:ssm:us-east-1:123456789012:parameter/my/param",
+			wantOK:   true,
+		},
+		{
+			name:   "non-ssm arn is not a parameter ref",
+			id:     "arn:aws:iam::123456789012:role/my-role",
+			wantOK: false,
+		},
+		{
+			name:     "ssm short form",
+			id:       "ssm:/my/param",
+			wantName: "/my/param",
+			wantOK:   true,
+		},
+		{
+			name:     "ssm short form preserves label/version selectors",
+			id:       "ssm:/my/param:2",
+			wantName: "/my/param:2",
+			wantOK:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotOK := parseParameterRef(tt.id)
+			if gotOK != tt.wantOK {
+				t.Fatalf("parseParameterRef(%q) ok = %v, want %v", tt.id, gotOK, tt.wantOK)
+			}
+			if gotOK && gotName != tt.wantName {
+				t.Fatalf("parseParameterRef(%q) name = %q, want %q", tt.id, gotName, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestResolveParameterStoreShortForm(t *testing.T) {
+	fake := &fakeParameterClient{
+		out: &ssm.GetParameterOutput{
+			Parameter: &types.Parameter{Value: aws.String("param-value")},
+		},
+	}
+	b := &awsBackend{params: fake}
+
+	got, err := b.Resolve(context.Background(), "ssm:/my/param")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "param-value" {
+		t.Fatalf("got %q, want %q", got, "param-value")
+	}
+	if fake.gotName != "/my/param" {
+		t.Fatalf("parameter name: got %q, want %q", fake.gotName, "/my/param")
+	}
+	if !fake.gotWithDecryption {
+		t.Fatal("expected WithDecryption to be requested")
+	}
+}
+
+func TestResolveParameterStoreARN(t *testing.T) {
+	const arn = "arn:aws:ssm:us-east-1:123456789012:parameter/my/param"
+	fake := &fakeParameterClient{
+		out: &ssm.GetParameterOutput{
+			Parameter: &types.Parameter{Value: aws.String("param-value")},
+		},
+	}
+	b := &awsBackend{params: fake}
+
+	got, err := b.Resolve(context.Background(), arn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "param-value" {
+		t.Fatalf("got %q, want %q", got, "param-value")
+	}
+	if fake.gotName != arn {
+		t.Fatalf("parameter name: got %q, want %q (ARN forwarded unchanged)", fake.gotName, arn)
+	}
+}
+
+func TestResolveParameterStoreNoValue(t *testing.T) {
+	fake := &fakeParameterClient{out: &ssm.GetParameterOutput{}}
+	b := &awsBackend{params: fake}
+
+	_, err := b.Resolve(context.Background(), "ssm:/my/param")
+	if err == nil {
+		t.Fatal("expected error when parameter has no value")
+	}
+	if !strings.Contains(err.Error(), "no value") {
+		t.Fatalf("expected 'no value' error, got: %v", err)
+	}
+}
+
+func TestResolveParameterStoreAPIError(t *testing.T) {
+	sentinel := errors.New("parameter not found")
+	fake := &fakeParameterClient{err: sentinel}
+	b := &awsBackend{params: fake}
+
+	_, err := b.Resolve(context.Background(), "ssm:/my/param")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected API error to propagate, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "getting parameter") {
+		t.Fatalf("expected wrapped context, got: %v", err)
+	}
+}
+
+func TestResolveParameterStoreDoesNotCallSecretsClient(t *testing.T) {
+	// A parameter reference must never reach the Secrets Manager client.
+	fakeSecrets := &fakeSecretsClient{out: &secretsmanager.GetSecretValueOutput{SecretString: aws.String("x")}}
+	fakeParams := &fakeParameterClient{
+		out: &ssm.GetParameterOutput{Parameter: &types.Parameter{Value: aws.String("v")}},
+	}
+	b := &awsBackend{secrets: fakeSecrets, params: fakeParams}
+
+	if _, err := b.Resolve(context.Background(), "ssm:/my/param"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fakeSecrets.called {
+		t.Fatal("secrets manager client should not be called for a parameter reference")
 	}
 }

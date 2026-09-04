@@ -16,7 +16,7 @@ type stubBackend struct {
 	err    error
 }
 
-func (s *stubBackend) GetSecret(_ context.Context, id string) (string, error) {
+func (s *stubBackend) Resolve(_ context.Context, id string) (string, error) {
 	if s.err != nil {
 		return "", s.err
 	}

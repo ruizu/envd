@@ -13,8 +13,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newRunCmd builds the `run` subcommand, which resolves secrets and executes
-// the target command with them injected as environment variables.
+// newRunCmd builds the `run` subcommand, which resolves secret/parameter
+// values and executes the target command with them injected as environment
+// variables.
 func newRunCmd() *cobra.Command {
 	var (
 		envs        []string
@@ -25,10 +26,18 @@ func newRunCmd() *cobra.Command {
 
 	runCmd := &cobra.Command{
 		Use:   "run [command] [args...]",
-		Short: "Resolve secrets and execute the given command",
-		Example: `  envd run --env SECRET_VAR1=aws_secret_id1 cli-to-run
-  envd run --env SECRET_VAR1=id1 --env SECRET_VAR2=id2 cli-to-run param1 param2
-  envd run --backend=aws --profile=test_profile --env SECRET_VAR1=id1 cli-to-run`,
+		Short: "Resolve secret/parameter values and execute the given command",
+		Example: `  # Run a database migration with the password pulled from Secrets Manager
+  envd run --env DB_PASSWORD=prod/db/password migrate --steps 3
+
+  # Start an app server with an API key and DB password, using a named profile
+  envd run --profile prod --env API_KEY=prod/stripe/key --env DB_PASSWORD=prod/db/password uvicorn app:server
+
+  # Select the "password" key from a JSON secret, pinned to a specific version stage
+  envd run --env DB_PASSWORD=arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-AbCdEf:password:AWSPREVIOUS: psql -U admin
+
+  # Pull the DB host from Parameter Store and credentials from Secrets Manager
+  envd run --env DB_HOST=ssm:/prod/db/host --env DB_USER=secretsmanager:prod/db:SecretString:username psql`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mappings, err := ParseEnvs(envs)
@@ -44,8 +53,8 @@ func newRunCmd() *cobra.Command {
 	}
 
 	runCmd.Flags().StringArrayVarP(&envs, "env", "e", nil,
-		"secret mapping VAR=secret_id (repeatable)")
-	runCmd.Flags().StringVar(&backendName, "backend", "aws", "secret backend to use")
+		"secret/parameter mapping VAR=secret_id (repeatable)")
+	runCmd.Flags().StringVar(&backendName, "backend", "aws", "backend to use")
 	runCmd.Flags().StringVar(&profile, "profile", "", "backend credentials/config profile (optional)")
 	runCmd.Flags().StringVar(&region, "region", "", "backend region (optional)")
 
@@ -58,7 +67,7 @@ func newRunCmd() *cobra.Command {
 }
 
 // run constructs the backend and executes the target command with the resolved
-// secrets injected. It is the wiring layer; runExec holds the testable logic.
+// values injected. It is the wiring layer; runExec holds the testable logic.
 func run(ctx context.Context, backendName string, opts backend.Options, mappings []SecretMapping, command string, cmdArgs []string) error {
 	b, err := backend.New(ctx, backendName, opts)
 	if err != nil {
@@ -70,12 +79,12 @@ func run(ctx context.Context, backendName string, opts backend.Options, mappings
 // runExec resolves each mapping against the given backend, layers the results
 // on top of the current environment, and executes the target command.
 func runExec(ctx context.Context, b backend.Backend, mappings []SecretMapping, command string, cmdArgs []string) error {
-	// Start from the current environment and layer resolved secrets on top.
-	// Later entries take precedence, so injected secrets override any existing
+	// Start from the current environment and layer resolved values on top.
+	// Later entries take precedence, so injected values override any existing
 	// variable of the same name.
 	env := os.Environ()
 	for _, m := range mappings {
-		value, err := b.GetSecret(ctx, m.SecretID)
+		value, err := b.Resolve(ctx, m.SecretID)
 		if err != nil {
 			return err
 		}
