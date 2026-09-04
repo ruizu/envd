@@ -101,7 +101,7 @@ FROM --platform=linux/arm64 ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 WORKDIR /app
 
 # Install envd (linux/arm64) into the image.
-ADD https://github.com/ruizu/envd/releases/download/v0.0.1/envd_0.0.1_linux_arm64.tar.gz /tmp/envd.tar.gz
+ADD https://github.com/ruizu/envd/releases/download/v0.1.0/envd_0.1.0_linux_arm64.tar.gz /tmp/envd.tar.gz
 RUN tar -xzf /tmp/envd.tar.gz -C /usr/local/bin envd && rm /tmp/envd.tar.gz
 
 COPY pyproject.toml uv.lock ./
